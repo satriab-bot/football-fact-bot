@@ -2,9 +2,8 @@ name: Generate Daily Football Fact
 
 on:
   schedule:
-    # Berjalan setiap hari pukul 17:00 UTC (artinya jam 00:00 WIB tengah malam)
     - cron: '0 17 * * *'
-  workflow_dispatch: # Tombol untuk menjalankan skrip secara manual kapan saja untuk testing
+  workflow_dispatch:
 
 jobs:
   build:
@@ -26,7 +25,7 @@ jobs:
       - name: Run Python Script
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        python generate_fact.py
+        run: python generate_fact.py
 
       - name: Commit and Push JSON Result
         run: |
