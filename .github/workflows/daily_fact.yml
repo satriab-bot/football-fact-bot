@@ -22,7 +22,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install google-genai duckduckgo-search
+          pip install google-genai duckduckgo-search requests beautifulsoup4
 
       - name: Run Python Script
         env:
