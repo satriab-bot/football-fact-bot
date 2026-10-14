@@ -25,9 +25,9 @@ def get_daily_football_fact():
     4. Awali teks dengan format tahun kejadian dalam tanda tebal, contoh: "<b>Tahun 2006:</b> [isi fakta...]"
     """
     
-    # Menggunakan model gemini-3.8-flash sesuai arahan server terbaru
+    # Menggunakan model gemini-3.5-flash sesuai arahan server terbaru
     response = client.models.generate_content(
-        model='gemini-3.8-flash',
+        model='gemini-3.5-flash-lite',
         contents=prompt,
     )
     
