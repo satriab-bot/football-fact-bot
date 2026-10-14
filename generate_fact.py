@@ -1,457 +1,295 @@
+"""
+Generator fakta sepak bola harian (versi anti-halusinasi).
 
+Alur:
+1. Ambil kandidat peristiwa dari Wikipedia "On This Day" (terstruktur: tahun + teks + ringkasan halaman).
+   Jika kosong, fallback ke DuckDuckGo dengan filter ketat (harus memuat tanggal DAN tahun).
+2. Gemini hanya boleh memilih & menulis ulang dari kandidat. Tahun diambil dari DATA, bukan dari AI.
+3. Cek deterministik: setiap angka di artikel harus ada di teks sumber.
+4. Cek LLM kedua (verifier, temperature 0): mencari klaim yang tidak didukung sumber.
+5. Jika gagal setelah beberapa percobaan, today_fact.json LAMA dibiarkan (tidak ditimpa)
+   dan skrip keluar dengan error, jadi lebih baik tidak update daripada update yang keliru.
+
+Dependensi: pip install google-genai requests duckduckgo_search
+"""
 import os
-import json
 import re
-import time
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from urllib.parse import urlparse
+import sys
+import json
+import html
+from datetime import datetime, timezone
 
 import requests
-from bs4 import BeautifulSoup
-from duckduckgo_search import DDGS
 from google import genai
+from google.genai import types
 
-# =========================================================
-# KONFIGURASI
-# =========================================================
+try:
+    from duckduckgo_search import DDGS
+except ImportError:  # DDG hanya fallback, jadi tidak wajib
+    DDGS = None
 
-API_KEY = os.environ.get("GEMINI_API_KEY")
-if not API_KEY:
+# ---------------------------------------------------------------- konfigurasi
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+VERIFIER_MODEL = os.environ.get("GEMINI_VERIFIER_MODEL", MODEL)
+MAX_ATTEMPTS = 3
+MAX_CANDIDATES = 12
+OUTPUT_FILE = "today_fact.json"
+HEADERS = {"User-Agent": "daily-football-fact/2.0 (ganti-dengan-email-atau-url-blogmu)"}
+
+MONTHS_ID = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli",
+             "Agustus", "September", "Oktober", "November", "Desember"]
+MONTHS_EN = ["January", "February", "March", "April", "May", "June", "July",
+             "August", "September", "October", "November", "December"]
+
+FOOTBALL_HINTS = ["football", "footballer", "soccer", "fifa", "uefa", "world cup",
+                  "premier league", "football league", "f.c.", " fc ", "a.f.c.",
+                  "copa", "serie a", "la liga", "bundesliga", "ligue 1", "libertadores"]
+NOT_SOCCER = ["american football", "canadian football", "australian rules", "gridiron",
+              "nfl", "rugby", "gaelic football", "college football", "ncaa"]
+
+api_key = os.environ.get("GEMINI_API_KEY")
+if not api_key:
     raise ValueError("GEMINI_API_KEY belum diset di GitHub Secrets!")
-
-MODEL = "gemini-3.5-flash-lite"
-TIMEZONE = ZoneInfo("Asia/Jakarta")
-
-client = genai.Client(api_key=API_KEY)
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
-    )
-}
-
-MAX_SEARCH_RESULTS = 5
-MAX_PAGES_TO_FETCH = 10
-MIN_INDEPENDENT_DOMAINS = 2
-
-# =========================================================
-# UTILITAS
-# =========================================================
-
-def clean_json(text):
-    """Mengambil JSON jika model membungkusnya dengan code fence."""
-    text = (text or "").strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    return json.loads(text)
+client = genai.Client(api_key=api_key)
 
 
-def get_domain(url):
-    """Normalisasi domain untuk mengurangi sumber duplikat."""
+# ---------------------------------------------------------------- pengumpulan sumber
+def looks_like_soccer(text: str) -> bool:
+    t = " " + text.lower() + " "
+    if any(bad in t for bad in NOT_SOCCER):
+        return False
+    return any(h in t for h in FOOTBALL_HINTS)
+
+
+def get_wikipedia_candidates(month: int, day: int) -> list[dict]:
+    """Sumber utama: Wikipedia On This Day (tahun & teks sudah terstruktur)."""
+    url = f"https://api.wikimedia.org/feed/v1/wikipedia/en/onthisday/all/{month:02d}/{day:02d}"
     try:
-        host = urlparse(url).netloc.lower()
-        if host.startswith("www."):
-            host = host[4:]
-        return host
-    except Exception:
-        return ""
+        r = requests.get(url, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        print(f"Wikipedia On This Day gagal: {e}")
+        return []
+
+    candidates = []
+    for kind in ("selected", "events", "births", "deaths"):
+        for item in data.get(kind, []):
+            text = item.get("text", "")
+            year = item.get("year")
+            pages = item.get("pages", [])
+            extracts = " ".join(p.get("extract", "") for p in pages[:2])
+            if year is None or not looks_like_soccer(text + " " + extracts):
+                continue
+            page_url = ""
+            if pages:
+                page_url = pages[0].get("content_urls", {}).get("desktop", {}).get("page", "")
+            candidates.append({
+                "year": int(year),
+                "kind": {"selected": "peristiwa", "events": "peristiwa",
+                         "births": "kelahiran", "deaths": "wafat"}[kind],
+                "text": text,
+                "context": extracts,
+                "url": page_url or "https://en.wikipedia.org/wiki/Main_Page",
+                "source": "Wikipedia",
+            })
+
+    # hilangkan duplikat (selected & events sering sama)
+    seen, unique = set(), []
+    for c in candidates:
+        key = (c["year"], c["text"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(c)
+    return unique
 
 
-def search_football_archives(date_obj):
-    """Cari arsip untuk tanggal dan bulan yang sedang diproses."""
-    day_month = date_obj.strftime("%d %B")
-    month_day = date_obj.strftime("%B %d")
-    day = date_obj.day
-    month = date_obj.strftime("%B")
-
+def get_ddg_candidates(month: int, day: int) -> list[dict]:
+    """Fallback: hanya terima snippet yang memuat tanggal persis DAN tahun 4 digit."""
+    if DDGS is None:
+        return []
+    month_en = MONTHS_EN[month - 1]
+    date_patterns = [rf"\b{day}\s+{month_en}\b", rf"\b{month_en}\s+{day}\b"]
     queries = [
-        f"football historical events {month_day} results archive",
-        f"football matches played on {day_month} historical results",
-        f"site:worldfootball.net football {day_month} historical matches",
-        f"football club official history {day} {month}",
-        f"sejarah pertandingan sepak bola {day_month}",
+        f'"{day} {month_en}" football match history',
+        f'"{month_en} {day}" football on this day',
     ]
-
-    found = {}
+    out, seen = [], set()
     try:
         with DDGS() as ddgs:
-            for query in queries:
-                print(f"Mencari: {query}")
-                try:
-                    results = ddgs.text(
-                        query,
-                        max_results=MAX_SEARCH_RESULTS
-                    )
-                    for result in results:
-                        url = result.get("href", "")
-                        if not url.startswith("http"):
-                            continue
-
-                        # Jangan mengumpulkan URL yang sama berulang kali.
-                        if url not in found:
-                            found[url] = {
-                                "url": url,
-                                "title": result.get("title", ""),
-                                "snippet": result.get("body", "")
-                            }
-                except Exception as exc:
-                    print(f"Pencarian dilewati: {exc}")
-
-                time.sleep(1)
-
-    except Exception as exc:
-        print(f"Pencarian gagal: {exc}")
-
-    return list(found.values())
+            for q in queries:
+                print(f"Mencari (fallback): {q}")
+                for r in ddgs.text(q, max_results=8):
+                    body = (r.get("body") or "").strip()
+                    if not body or body in seen:
+                        continue
+                    if not any(re.search(p, body, re.I) for p in date_patterns):
+                        continue
+                    years = re.findall(r"\b(1[89]\d\d|20[0-2]\d)\b", body)
+                    if not years or not looks_like_soccer(body):
+                        continue
+                    seen.add(body)
+                    out.append({
+                        "year": int(years[0]),
+                        "kind": "peristiwa",
+                        "text": body,
+                        "context": "",
+                        "url": r.get("href", ""),
+                        "source": r.get("title", "Web"),
+                    })
+    except Exception as e:
+        print(f"Pencarian DuckDuckGo kendala: {e}")
+    return out
 
 
-def fetch_page(source):
-    """Ambil teks halaman asli, bukan hanya snippet mesin pencari."""
-    try:
-        response = requests.get(
-            source["url"],
-            headers=HEADERS,
-            timeout=12
-        )
-        response.raise_for_status()
-
-        content_type = response.headers.get("Content-Type", "")
-        if "html" not in content_type.lower():
-            return None
-
-        # Hindari memproses halaman yang terlalu besar.
-        if len(response.content) > 3_000_000:
-            return None
-
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        for tag in soup([
-            "script", "style", "nav", "footer",
-            "header", "form", "noscript", "svg"
-        ]):
-            tag.decompose()
-
-        text = " ".join(soup.stripped_strings)
-        text = re.sub(r"\s+", " ", text).strip()
-
-        if len(text) < 250:
-            return None
-
-        return {
-            "url": source["url"],
-            "title": source["title"] or soup.title.get_text(" ", strip=True)
-            if soup.title else source["title"],
-            "domain": get_domain(source["url"]),
-            "content": text[:7000]
-        }
-
-    except Exception as exc:
-        print(f"Tidak dapat membaca {source['url']}: {exc}")
-        return None
+def source_text_of(c: dict) -> str:
+    return f"{c['text']} {c['context']}"
 
 
-def collect_sources(search_results):
-    """Ambil halaman dari beberapa domain berbeda."""
-    sources = []
-    used_domains = set()
-
-    for result in search_results:
-        domain = get_domain(result["url"])
-        if not domain or domain in used_domains:
-            continue
-
-        page = fetch_page(result)
-        if not page:
-            continue
-
-        page["id"] = f"S{len(sources) + 1}"
-        sources.append(page)
-        used_domains.add(domain)
-
-        print(f"Sumber berhasil dibaca: {domain}")
-
-        if len(sources) >= MAX_PAGES_TO_FETCH:
-            break
-
-    return sources
+# ---------------------------------------------------------------- pemanggilan model
+def call_json(model: str, prompt: str) -> dict:
+    resp = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.2,
+            response_mime_type="application/json",
+        ),
+    )
+    raw = re.sub(r"^```(?:json)?|```$", "", resp.text.strip(), flags=re.M).strip()
+    return json.loads(raw)
 
 
-# =========================================================
-# TAHAP 1: PILIH PERISTIWA BERDASARKAN BUKTI
-# =========================================================
-
-def select_candidate(date_obj, sources):
-    day_month = date_obj.strftime("%d %B")
-    source_data = json.dumps(sources, ensure_ascii=False)
+def write_article(candidates: list[dict], date_label: str, feedback: list[str]) -> dict:
+    listing = "\n\n".join(
+        f"[{i}] ({c['kind']}, tahun {c['year']}) {c['text']}\n    Konteks: {c['context'] or '-'}"
+        for i, c in enumerate(candidates)
+    )
+    feedback_block = ""
+    if feedback:
+        feedback_block = ("\nPERCOBAAN SEBELUMNYA DITOLAK KARENA:\n- " + "\n- ".join(feedback) +
+                          "\nPerbaiki dengan membuang klaim tersebut, atau pilih kandidat lain.\n")
 
     prompt = f"""
-Kamu adalah peneliti sejarah sepak bola yang sangat berhati-hati.
+Kamu penulis blog sejarah sepak bola yang SANGAT mengutamakan akurasi. Tanggal hari ini: {date_label}.
 
-Tanggal target: {day_month}.
-Tahun kejadian boleh tahun berapa pun.
+KANDIDAT (satu-satunya sumber fakta yang boleh kamu pakai):
+{listing}
+{feedback_block}
+ATURAN MUTLAK:
+1. Pilih SATU kandidat yang benar-benar tentang sepak bola (association football/soccer).
+2. Gunakan HANYA fakta yang tertulis eksplisit di kandidat terpilih (teks + konteks).
+   Tahun, nama pemain/klub/stadion, skor, angka, dan lokasi harus tertulis di sana.
+3. DILARANG menambah detail yang tidak ada di sumber: suasana stadion, jumlah penonton,
+   cuaca, kutipan, perasaan pemain, status "rival", julukan, atau latar sejarah dari ingatanmu.
+4. Jika informasi di sumber sedikit, tulis lebih singkat dan sederhana.
+   Lebih baik pendek tapi benar daripada panjang tapi mengarang.
+5. Jangan menyebut tanggal/tahun/angka apa pun yang tidak ada di sumber.
+6. Bahasa Indonesia, gaya bercerita ringan tapi tetap faktual. 3 atau 4 paragraf pendek.
+7. Jangan tulis tahun di judul; tahun akan ditambahkan sistem.
 
-SUMBER YANG BERHASIL DIBACA:
-{source_data}
-
-TUGAS:
-Pilih satu peristiwa sepak bola yang benar-benar didukung oleh
-sumber di atas dan terjadi pada tanggal serta bulan target.
-
-SYARAT MUTLAK:
-1. Tanggal dan bulan kejadian harus cocok dengan tanggal target.
-2. Jangan menyimpulkan tanggal kejadian dari tanggal publikasi artikel.
-3. Tahun, klub, lawan, skor, pencetak gol, dan lokasi hanya boleh
-   digunakan jika didukung oleh sumber.
-4. Bedakan tanggal pertandingan dari tanggal pembukaan stadion,
-   tanggal pendirian klub, atau tanggal peristiwa lain.
-5. Gunakan setidaknya dua sumber dari domain berbeda yang secara
-   nyata mendukung fakta inti yang sama.
-6. Dua situs yang hanya menyalin berita identik bukan bukti
-   independen yang memadai.
-7. Jika tidak ada peristiwa yang cukup kuat, nyatakan TIDAK LAYAK.
-8. Jangan mengarang fakta atau mengisi informasi yang tidak tersedia.
-9. Prioritaskan arsip resmi klub, liga, federasi, dan catatan
-   pertandingan yang dapat diverifikasi.
-
-KELUARAN HARUS BERUPA JSON VALID SAJA:
-{{
-  "layak": true,
-  "judul": "Judul singkat peristiwa",
-  "tahun": 1900,
-  "tanggal": "03 September",
-  "jenis": "pertandingan",
-  "fakta_inti": [
-    "Fakta yang didukung sumber"
-  ],
-  "source_ids": ["S1", "S2"],
-  "alasan": "Alasan kelayakan berdasarkan bukti"
-}}
-
-Jika tidak layak, gunakan:
-{{
-  "layak": false,
-  "judul": "",
-  "tahun": null,
-  "tanggal": "",
-  "jenis": "",
-  "fakta_inti": [],
-  "source_ids": [],
-  "alasan": "Penjelasan singkat"
-}}
-
-Jangan pernah mengisi layak=true hanya untuk memenuhi tugas.
+KELUARKAN HANYA JSON dengan format:
+{{"candidate_index": <int>, "title": "<judul singkat tanpa tahun>", "paragraphs": ["<p1>", "<p2>", "<p3>"]}}
 """
-
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=prompt
-    )
-    return clean_json(response.text)
+    return call_json(MODEL, prompt)
 
 
-# =========================================================
-# TAHAP 2: AUDIT FAKTA DAN PENULISAN
-# =========================================================
-
-def verify_and_write(date_obj, candidate, sources):
-    source_map = {s["id"]: s for s in sources}
-
-    selected_sources = [
-        source_map[sid]
-        for sid in candidate.get("source_ids", [])
-        if sid in source_map
-    ]
-
-    domains = {
-        s["domain"] for s in selected_sources if s.get("domain")
-    }
-
-    if len(domains) < MIN_INDEPENDENT_DOMAINS:
-        return None
-
-    day_month = date_obj.strftime("%d %B")
-
+def llm_verify(article_text: str, source: str) -> list[str]:
     prompt = f"""
-Kamu bertugas sebagai editor verifikasi fakta sepak bola.
+Kamu fact-checker ketat. Bandingkan ARTIKEL dengan SUMBER.
+Daftar setiap klaim faktual di artikel (tahun, nama, klub, skor, angka, lokasi, hubungan antar pihak,
+suasana, hasil pertandingan) yang TIDAK tertulis atau TIDAK bisa disimpulkan langsung dari SUMBER.
+Embel-embel dramatis yang tidak ada di sumber juga dihitung tidak didukung.
 
-Tanggal target: {day_month}
+SUMBER:
+{source}
 
-KANDIDAT PERISTIWA:
-{json.dumps(candidate, ensure_ascii=False)}
+ARTIKEL:
+{article_text}
 
-SUMBER YANG HARUS DIPERIKSA:
-{json.dumps(selected_sources, ensure_ascii=False)}
-
-PERIKSA ULANG SEBELUM MENULIS:
-- Apakah tanggal dan bulan peristiwa benar-benar cocok?
-- Apakah tahun kejadian didukung sumber?
-- Apakah semua fakta inti dapat ditelusuri ke sumber?
-- Apakah ada kontradiksi mengenai lawan, skor, stadion, atau hasil?
-- Apakah sumber benar-benar mendukung klaim, bukan sekadar
-  menyebut nama klub atau peristiwa yang mirip?
-- Apakah ada detail narasi yang hanya merupakan dugaan?
-
-Jangan menganggap keputusan tahap sebelumnya otomatis benar.
-Jika ada keraguan penting atau kontradiksi yang belum terselesaikan,
-verifikasi harus gagal.
-
-Jika lolos, tulis artikel Bahasa Indonesia:
-- 3 paragraf pendek dengan tag HTML <p>...</p>.
-- Paragraf pertama diawali dengan tahun dan judul dalam format:
-  <p><b>Tahun 1900 - Judul:</b> ...</p>
-- Gaya storytelling menarik, tetapi tidak sensasional.
-- Semua detail harus bersumber.
-- Dilarang mengarang suasana stadion, reaksi penonton, motif,
-  jumlah penonton, pencetak gol, atau detail lain.
-- Jangan mengklaim pertandingan berlangsung sengit atau dramatis
-  tanpa bukti yang mendukung.
-- Jangan menggunakan informasi yang tidak tersedia hanya demi
-  membuat tulisan lebih panjang.
-- Pertahankan ketidakpastian jika sumber tidak sepakat.
-- Tidak perlu mengulang semua sumber di dalam artikel.
-
-KELUARAN JSON VALID SAJA:
-{{
-  "lolos": true,
-  "tanggal_terverifikasi": "{day_month}",
-  "tahun_terverifikasi": 1900,
-  "fakta_terverifikasi": [
-    "Fakta inti yang telah diperiksa"
-  ],
-  "fact": "<p><b>Tahun 1900 - Judul:</b> ...</p><p>...</p><p>...</p>",
-  "alasan": "Ringkasan hasil pemeriksaan"
-}}
-
-Jika gagal, gunakan:
-{{
-  "lolos": false,
-  "tanggal_terverifikasi": "",
-  "tahun_terverifikasi": null,
-  "fakta_terverifikasi": [],
-  "fact": "",
-  "alasan": "Alasan kegagalan"
-}}
-
-Jangan pernah mengembalikan lolos=true jika bukti tidak memadai.
+KELUARKAN HANYA JSON: {{"valid": <true/false>, "unsupported_claims": ["...", "..."]}}
+"valid" = true hanya jika unsupported_claims kosong.
 """
-
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=prompt
-    )
-
-    audit = clean_json(response.text)
-
-    if not audit.get("lolos"):
-        print("Verifikasi gagal:", audit.get("alasan"))
-        return None
-
-    # Pemeriksaan tambahan oleh program, bukan hanya oleh AI.
-    if audit.get("tanggal_terverifikasi") != day_month:
-        print("Ditolak: tanggal hasil audit tidak cocok.")
-        return None
-
-    if audit.get("tahun_terverifikasi") != candidate.get("tahun"):
-        print("Ditolak: tahun hasil audit tidak cocok.")
-        return None
-
-    fact = audit.get("fact", "").strip()
-
-    if not fact.startswith("<p><b>Tahun "):
-        print("Ditolak: format artikel tidak sesuai.")
-        return None
-
-    if fact.count("<p>") != 3 or fact.count("</p>") != 3:
-        print("Ditolak: artikel harus terdiri dari 3 paragraf.")
-        return None
-
-    return {
-        "fact": fact,
-        "audit": audit,
-        "sources": selected_sources
-    }
+    result = call_json(VERIFIER_MODEL, prompt)
+    return [] if result.get("valid") else result.get("unsupported_claims") or ["klaim tidak terverifikasi"]
 
 
-# =========================================================
-# PROSES UTAMA
-# =========================================================
+# ---------------------------------------------------------------- pengecekan deterministik
+def numbers_in(text: str) -> set[str]:
+    return set(re.findall(r"\d+", text))
 
-def get_daily_football_fact():
-    now = datetime.now(TIMEZONE)
-    day_month = now.strftime("%d %B")
 
-    print(f"Mencari fakta sepak bola untuk {day_month}...")
+def deterministic_check(article_text: str, source: str, today_day: int) -> list[str]:
+    """Setiap angka di artikel harus muncul di sumber (kecuali tanggal hari ini)."""
+    allowed = numbers_in(source) | {str(today_day)}
+    missing = sorted(numbers_in(article_text) - allowed)
+    return [f"angka '{n}' tidak ada di sumber" for n in missing]
 
-    search_results = search_football_archives(now)
 
-    if not search_results:
-        raise RuntimeError("Tidak ada hasil pencarian. Artikel dibatalkan.")
+# ---------------------------------------------------------------- main
+def build_html(candidate: dict, draft: dict) -> str:
+    title = html.escape(draft["title"].strip().rstrip(":"))
+    paragraphs = [html.escape(p.strip()) for p in draft["paragraphs"] if p.strip()]
+    parts = [f"<p><b>Tahun {candidate['year']} - {title}:</b> {paragraphs[0]}</p>"]
+    parts += [f"<p>{p}</p>" for p in paragraphs[1:]]
+    if candidate.get("url"):
+        parts.append(f'<p><small>Sumber: <a href="{html.escape(candidate["url"])}" '
+                     f'target="_blank" rel="noopener">{html.escape(candidate["source"])}</a></small></p>')
+    return "\n".join(parts)
 
-    sources = collect_sources(search_results)
 
-    if len(sources) < MIN_INDEPENDENT_DOMAINS:
-        raise RuntimeError(
-            "Sumber yang berhasil dibaca tidak mencukupi. "
-            "Artikel dibatalkan demi menjaga akurasi."
-        )
+def main() -> int:
+    now = datetime.now(timezone.utc)  # UTC: acuan universal untuk pembaca di seluruh dunia
+    date_label = f"{now.day} {MONTHS_ID[now.month - 1]}"
+    print(f"Memproses fakta bola untuk {date_label}...")
 
-    print(f"Total halaman yang berhasil dibaca: {len(sources)}")
+    candidates = get_wikipedia_candidates(now.month, now.day)
+    if not candidates:
+        candidates = get_ddg_candidates(now.month, now.day)
+    if not candidates:
+        print("Tidak ada kandidat sumber yang valid. File lama dipertahankan.")
+        return 1
+    candidates = candidates[:MAX_CANDIDATES]
+    print(f"{len(candidates)} kandidat ditemukan.")
 
-    candidate = select_candidate(now, sources)
+    feedback: list[str] = []
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        print(f"Percobaan {attempt}/{MAX_ATTEMPTS}...")
+        try:
+            draft = write_article(candidates, date_label, feedback)
+            idx = int(draft["candidate_index"])
+            chosen = candidates[idx]
+            if not draft.get("paragraphs"):
+                raise ValueError("paragraf kosong")
+        except Exception as e:
+            print(f"Output model tidak valid: {e}")
+            feedback = [f"format output salah ({e})"]
+            continue
 
-    if not candidate.get("layak"):
-        raise RuntimeError(
-            "Tidak ditemukan peristiwa dengan bukti memadai: "
-            + candidate.get("alasan", "")
-        )
+        article_text = f"{draft['title']} " + " ".join(draft["paragraphs"])
+        source = source_text_of(chosen)
 
-    allowed_ids = {s["id"] for s in sources}
-    candidate_ids = candidate.get("source_ids", [])
+        problems = deterministic_check(article_text, source, now.day)
+        if not problems:
+            try:
+                problems = llm_verify(article_text, source)
+            except Exception as e:
+                problems = [f"verifier gagal dijalankan ({e})"]
 
-    if (
-        len(set(candidate_ids)) < MIN_INDEPENDENT_DOMAINS
-        or not set(candidate_ids).issubset(allowed_ids)
-    ):
-        raise RuntimeError(
-            "Referensi kandidat tidak valid. Artikel dibatalkan."
-        )
+        if problems:
+            print("Ditolak:", problems)
+            feedback = problems
+            continue
 
-    result = verify_and_write(now, candidate, sources)
+        data = {"date": date_label, "fact": build_html(chosen, draft)}
+        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+        print(f"Berhasil memperbarui {OUTPUT_FILE} (sumber: {chosen['url']})")
+        return 0
 
-    if not result:
-        raise RuntimeError(
-            "Artikel tidak lolos audit fakta. Tidak ada artikel baru."
-        )
-
-    data = {
-        "date": day_month,
-        "fact": result["fact"],
-        "verified": True,
-        "event_year": result["audit"]["tahun_terverifikasi"],
-        "sources": [
-            {
-                "title": s["title"],
-                "url": s["url"],
-                "domain": s["domain"]
-            }
-            for s in result["sources"]
-        ],
-        "verification_notes": result["audit"]["alasan"]
-    }
-
-    with open("today_fact.json", "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
-
-    print("Artikel lolos pemeriksaan dan today_fact.json diperbarui.")
-    print("Tahun kejadian:", data["event_year"])
-    print("Jumlah sumber:", len(data["sources"]))
+    print("Semua percobaan gagal verifikasi. File lama dipertahankan.")
+    return 1
 
 
 if __name__ == "__main__":
-    try:
-        get_daily_football_fact()
-    except Exception as exc:
-        print(f"PROSES DIBATALKAN: {exc}")
-        raise
+    sys.exit(main())
