@@ -70,7 +70,7 @@ def search_football_archives(date_obj):
         f"football historical events {month_day} results archive",
         f"football matches played on {day_month} historical results",
         f"site:worldfootball.net football {day_month} historical matches",
-        f"football club official history {day} {month",
+        f"football club official history {day} {month}",
         f"sejarah pertandingan sepak bola {day_month}",
     ]
 
