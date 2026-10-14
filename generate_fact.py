@@ -1,14 +1,15 @@
 import os
 import json
 from datetime import datetime
-import google.generativeai as genai
+from google import genai
 
-# Konfigurasi API Key dari Environment Variable GitHub
+# Ambil API Key dari GitHub Secrets
 api_key = os.environ.get("GEMINI_API_KEY")
 if not api_key:
     raise ValueError("GEMINI_API_KEY belum diset di GitHub Secrets!")
 
-genai.configure(api_key=api_key)
+# Inisialisasi client dengan SDK google-genai terbaru
+client = genai.Client(api_key=api_key)
 
 def get_daily_football_fact():
     today = datetime.now()
@@ -24,12 +25,16 @@ def get_daily_football_fact():
     4. Awali teks dengan format tahun kejadian dalam tanda tebal, contoh: "<b>Tahun 2006:</b> [isi fakta...]"
     """
     
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    response = model.generate_content(prompt)
+    # Menggunakan model gemini-2.5-flash pada SDK baru
+    response = client.models.generate_content(
+        model='gemini-2.5-flash',
+        contents=prompt,
+    )
+    
     return response.text.strip()
 
 if __name__ == "__main__":
-    print("Sedang meminta fakta sepak bola dari AI...")
+    print("Mengeksekusi permintaan fakta sepak bola ke Gemini API...")
     fact_content = get_daily_football_fact()
     
     data = {
