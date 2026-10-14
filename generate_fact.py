@@ -1,8 +1,8 @@
 import os
 import json
 from datetime import datetime
-import requests
 from google import genai
+from duckduckgo_search import DDGS
 
 api_key = os.environ.get("GEMINI_API_KEY")
 if not api_key:
@@ -10,60 +10,52 @@ if not api_key:
 
 client = genai.Client(api_key=api_key)
 
-def fetch_wikipedia_events():
-    """Mengambil data peristiwa sejarah terstruktur dari arsip resmi Wikipedia hari ini"""
-    today = datetime.now()
-    month = f"{today.month:02d}"
-    day = f"{today.day:02d}"
+def search_football_archives(date_str):
+    """Mencari data secara spesifik ke Wikipedia dan portal berita bola dunia via DuckDuckGo"""
+    # Targetkan pencarian ke situs arsip dan berita bola terkemuka
+    queries = [
+        f"on this day football {date_str} site:en.wikipedia.org",
+        f"football history match {date_str} site:espn.com OR site:goal.com OR site:skysports.com"
+    ]
     
-    # Endpoint resmi arsip sejarah Wikipedia (berisi kejadian valid yang sudah dikurasi global)
-    url = f"https://en.wikipedia.org/api/rest_v1/feed/onthisday/all/{month}/{day}"
-    
+    results_text = ""
     try:
-        response = requests.get(url)
-        data = response.json()
-        events = data.get("events", [])
-        
-        # Filter kata kunci sepak bola agar benar-benar akurat
-        keywords = ['football', 'soccer', 'fifa', 'uefa', 'champions league', 'world cup', 'stadium', 'goal', 'match', 'club', 'league']
-        football_events = []
-        
-        for e in events:
-            text = e.get("text", "").lower()
-            if any(kw in text for kw in keywords) and 'american football' not in text:
-                football_events.append({
-                    "year": e.get("year"),
-                    "text": e.get("text")
-                })
-        return football_events
+        with DDGS() as ddgs:
+            for q in queries:
+                print(f"Mencari target: {q}")
+                for r in ddgs.text(q, max_results=3):
+                    results_text += f"Sumber: {r.get('title')}\nInfo: {r.get('body')}\n\n"
     except Exception as e:
-        print(f"Gagal mengambil data dari Wikipedia API: {e}")
-        return []
+        print(f"Pencarian DuckDuckGo mengalami kendala: {e}")
+        
+    return results_text
 
 def get_daily_football_fact():
-    # 1. Ambil data mentah yang dijamin valid dari arsip Wikipedia
-    events = fetch_wikipedia_events()
+    today = datetime.now()
+    date_str = today.strftime("%d %B") # Contoh: 14 October / 14 Oktober
     
-    if not events:
-        return "<p><b>Hari Ini Dalam Sejarah:</b> Belum ada catatan arsip pertandingan sepak bola besar yang terekam untuk tanggal hari ini.</p>"
+    # 1. Cari data dari sumber terarah (Wikipedia & Portal Bola)
+    archive_data = search_football_archives(date_str)
     
-    # Pilih salah satu peristiwa secara random dari arsip valid
-    import random
-    selected_event = random.choice(events)
-    raw_year = selected_event["year"]
-    raw_text = selected_event["text"]
-    
-    # 2. Suruh Gemini HANYA merapikan dan menceritakan ulang fakta yang SUDAH PASTI ini (Tanpa boleh mengubah tahun/fakta)
+    # Fallback jika data kosong (memperluas kueri umum khusus bola)
+    if not archive_data.strip():
+        with DDGS() as ddgs:
+            for r in ddgs.text(f"historic football match event on {date_str}", max_results=4):
+                archive_data += f"Info: {r.get('body')}\n"
+
+    # 2. Berikan data spesifik tersebut ke Gemini untuk diverifikasi dan dijadikan narasi
     prompt = f"""
-    Kamu adalah penulis narasi sepak bola profesional. Di bawah ini adalah data peristiwa sejarah sepak bola yang VALID dan NYATA dari arsip:
-    - Tahun: {raw_year}
-    - Peristiwa: {raw_text}
+    Berdasarkan data arsip dan portal berita sepak bola dunia berikut ini untuk tanggal {date_str}:
     
-    Tugasmu:
-    1. Ubah data di atas menjadi narasi Bahasa Indonesia dengan gaya storytelling yang memukau, mendalam, dan seru untuk pembaca blog sepak bola.
-    2. JANGAN MENGUBAH TAHUN, NAMA, ATAU FAKTA UTAMA DI ATAS. Tetap pertahankan keakuratan sejarahnya.
-    3. WAJIB dibagi menjadi 3 atau 4 paragraf pendek yang dipisahkan dengan tag HTML <p>...</p>.
-    4. Paragraf pertama HARUS diawali dengan tahun kejadian dan ringkasan peristiwa dalam tanda tebal, contoh: <p><b>Tahun {raw_year} - [Judul Menarik]:</b> [isi cerita...]</p>
+    DATA ARSIP INTERNET:
+    {archive_data}
+    
+    Instruksi Ketat:
+    1. Pilih 1 peristiwa sejarah sepak bola yang PALING MENARIK dan VALID dari data di atas. 
+    2. Pastikan tahun, klub/negara, dan fakta peristiwanya akurat berdasarkan data arsip tersebut (JANGAN MENGARANG FAKTA).
+    3. Tulis dalam Bahasa Indonesia dengan gaya narasi storytelling yang memukau dan seru untuk pembaca blog.
+    4. WAJIB dibagi menjadi 3 atau 4 paragraf pendek yang dipisahkan dengan tag HTML <p>...</p>.
+    5. TAHUN KEJADIAN WAJIB DITULIS DI PARAGRAF PERTAMA! Kalimat pertama pada paragraf pertama HARUS diawali dengan tahun kejadian dan judul peristiwa dalam tanda tebal, contoh: <p><b>Tahun 1999 - Judul Peristiwa:</b> [isi cerita...]</p>
     """
     
     response = client.models.generate_content(
@@ -74,7 +66,7 @@ def get_daily_football_fact():
     return response.text.strip()
 
 if __name__ == "__main__":
-    print("Mengambil data arsip resmi dan merapikannya...")
+    print("Mencari arsip bola terarah...")
     fact_content = get_daily_football_fact()
     
     data = {
@@ -85,4 +77,4 @@ if __name__ == "__main__":
     with open("today_fact.json", "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
         
-    print("Berhasil memperbarui today_fact.json dengan data arsip tervalidasi!")
+    print("Berhasil memperbarui today_fact.json dengan arsip terarah!")
