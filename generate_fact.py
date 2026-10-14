@@ -24,7 +24,7 @@ def get_daily_football_fact():
     4. Awali teks dengan format tahun kejadian dalam tanda tebal, contoh: "<b>Tahun 2006:</b> [isi fakta...]"
     """
     
-    model = genai.GenerativeModel('gemini-3.6-flash')
+    model = genai.GenerativeModel('gemini-1.5-flash')
     response = model.generate_content(prompt)
     return response.text.strip()
 
