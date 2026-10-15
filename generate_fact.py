@@ -366,7 +366,7 @@ ATURAN MUTLAK:
 5. Jika informasi di sumber sedikit, tulis lebih singkat dan sederhana.
    Lebih baik pendek tapi benar daripada panjang tapi mengarang.
 6. Jangan menyebut tanggal/tahun/angka apa pun yang tidak ada di sumber.
-7. Bahasa Indonesia, gaya bercerita ringan tapi tetap faktual. 3 atau 4 paragraf pendek.
+7. Bahasa Indonesia, gaya bercerita ringan tapi tetap faktual. 3 atau 4 paragraf, boleh lebih jika sumber sangat kaya informasi.
 8. Jangan tulis tahun di judul; tahun akan ditambahkan sistem.
 
 KELUARKAN HANYA JSON dengan format:
