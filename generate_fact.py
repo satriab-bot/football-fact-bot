@@ -107,6 +107,15 @@ ENTRY_RE = re.compile(
     re.S,
 )
 
+# Kata bernada kematian/duka (pakai batas kata agar "meninggalkan klub" tidak ikut terjaring).
+HARD_DEATH_RES = [re.compile(p, re.I) for p in (
+    r"\bmeninggal\b", r"\bwafat\b", r"\balmarhum\w*", r"\bmendiang\b", r"\bberpulang\b",
+    r"\btutup usia\b", r"\bduka\b", r"\bin memoriam\b",
+)]
+SOFT_DEATH_RES = [re.compile(r"\bmengenang\b", re.I)]  # ambigu: wajar untuk peristiwa, janggal untuk kelahiran
+SOURCE_DEATH_RE = re.compile(
+    r"\b(died|death|dies|dead|killed|passed away|funeral|murdered|tragedy|disaster)\b", re.I)
+
 api_key = os.environ.get("GEMINI_API_KEY")
 if not api_key:
     raise ValueError("GEMINI_API_KEY belum diset di GitHub Secrets!")
@@ -187,15 +196,25 @@ def get_wikipedia_candidates(month: int, day: int) -> list[dict]:
             page_url = ""
             if pages:
                 page_url = pages[0].get("content_urls", {}).get("desktop", {}).get("page", "")
+            kind_id = {"selected": "peristiwa", "events": "peristiwa",
+                       "births": "kelahiran", "deaths": "wafat"}[kind]
+            first_extract = pages[0].get("extract", "") if pages else ""
+            if kind_id == "kelahiran":
+                status = life_status(first_extract)
+            elif kind_id == "wafat":
+                status = "meninggal"
+            else:
+                status = ""
             candidates.append({
                 "year": int(year),
-                "kind": {"selected": "peristiwa", "events": "peristiwa",
-                         "births": "kelahiran", "deaths": "wafat"}[kind],
+                "kind": kind_id,
                 "text": text,
                 "context": extracts,
                 "url": page_url or "https://en.wikipedia.org/wiki/Main_Page",
                 "source": "Wikipedia",
                 "support": [],
+                "subject": text.split(",")[0].strip() if kind_id != "peristiwa" else "",
+                "status": status,
             })
 
     seen, unique = set(), []
@@ -317,7 +336,7 @@ def corroborate(c: dict) -> list[dict]:
 
 def source_text_of(c: dict) -> str:
     # Tahun disertakan karena disimpan terpisah dari teks (data terstruktur), padahal sah disebut artikel.
-    parts = [str(c["year"]), c["text"], c["context"]] + [s["text"] for s in c["support"]]
+    parts = [str(c["year"]), c.get("lead", ""), c["text"], c["context"]] + [s["text"] for s in c["support"]]
     return " ".join(p for p in parts if p)
 
 
@@ -339,6 +358,11 @@ def write_article(candidates: list[dict], date_label: str, feedback: list[str]) 
     blocks = []
     for i, c in enumerate(candidates):
         block = f"[{i}] ({c['kind']}, tahun {c['year']}) [{c['source']}] {c['text']}\n    Konteks: {c['context'] or '-'}"
+        if c["kind"] == "kelahiran":
+            block += (f"\n    PENTING: ini adalah KELAHIRAN tokoh pada tanggal hari ini. "
+                      f"Status hidup: {c.get('status') or 'tidak diketahui'}.")
+        elif c["kind"] == "wafat":
+            block += "\n    PENTING: ini adalah WAFATNYA tokoh pada tanggal hari ini."
         for s in c["support"]:
             block += f"\n    Sumber tambahan [{s['source']}]: {s['text']}"
         blocks.append(block)
@@ -363,11 +387,20 @@ ATURAN MUTLAK:
 3. Jika dua sumber berbeda pada suatu detail, JANGAN tulis detail itu. Tulis hanya yang disepakati.
 4. DILARANG menambah detail yang tidak ada di sumber: suasana stadion, jumlah penonton,
    cuaca, kutipan, perasaan pemain, status "rival", julukan, atau latar sejarah dari ingatanmu.
-5. Jika informasi di sumber sedikit, tulis lebih singkat dan sederhana.
+5. Jika informasi di sumber sedikit, tulis lebih sederhana.
    Lebih baik pendek tapi benar daripada panjang tapi mengarang.
 6. Jangan menyebut tanggal/tahun/angka apa pun yang tidak ada di sumber.
-7. Bahasa Indonesia, gaya bercerita ringan tapi tetap faktual. 3 atau 4 paragraf, boleh lebih jika sumber sangat kaya informasi.
+7. Bahasa Indonesia, gaya bercerita ringan tapi tetap faktual. 2 sampai 4 paragraf, boleh lebih jika informasi di sumber sangat banyak.
 8. Jangan tulis tahun di judul; tahun akan ditambahkan sistem.
+9. Jika kandidat berjenis "kelahiran": sistem SUDAH menulis judul dan kalimat pembuka yang menyatakan
+   tokoh itu lahir pada tanggal ini. Jangan ulangi kalimat itu; lanjutkan dengan karier/prestasi yang
+   tertulis di sumber. Nada netral-positif. DILARANG memakai nada duka atau kata seperti "mengenang",
+   "almarhum", "mendiang", "meninggal", "tutup usia" untuk tokoh yang tidak tercatat meninggal.
+10. Jika kandidat berjenis "wafat": sistem sudah menulis judul dan kalimat pembuka. Gunakan nada hormat
+    dan tenang, bukan perayaan.
+11. Untuk judul kandidat "peristiwa": deskriptif dan netral. Jangan memakai kata "Mengenang".
+12. Tulis tokoh yang masih hidup dengan kata kerja masa kini/lampau yang tepat; jangan menyiratkan
+    bahwa ia sudah tiada.
 
 KELUARKAN HANYA JSON dengan format:
 {{"candidate_index": <int>, "title": "<judul singkat tanpa tahun>", "paragraphs": ["<p1>", "<p2>", "<p3>"]}}
@@ -409,11 +442,64 @@ def deterministic_check(article_text: str, source: str, today_day: int) -> list[
     return [f"angka '{n}' tidak ada di sumber" for n in missing]
 
 
+def life_status(extract: str) -> str:
+    """
+    Tentukan 'hidup' / 'meninggal' / 'tidak diketahui' dari tanda kurung di awal ringkasan Wikipedia:
+      "(born 15 October 1977)"           -> hidup
+      "(15 October 1977 - 3 June 2020)"  -> meninggal
+    Jika ragu, hasilnya 'tidak diketahui' (aman: tidak ada klaim usia atau nada duka).
+    """
+    inners = re.findall(r"\(([^)]{0,160})\)", extract[:300])
+    for inner in inners:
+        if re.search(r"\bdied\b", inner) or re.search(r"\d{4}\s*[\u2013\u2014-]\s*[^)]*?\d{4}", inner):
+            return "meninggal"
+    for inner in inners:
+        if re.search(r"\bborn\b", inner):
+            return "hidup"
+    return "tidak diketahui"
+
+
+def framing(c: dict, now: datetime) -> tuple[str, str]:
+    """
+    Judul + kalimat pembuka yang dibuat KODE (bukan AI) untuk kelahiran/wafat, supaya jenis
+    peristiwanya selalu eksplisit dan nadanya tepat. Untuk 'peristiwa' mengembalikan ("", "").
+    """
+    if c["kind"] not in ("kelahiran", "wafat"):
+        return "", ""
+    name = c.get("subject") or c["text"].split(",")[0].strip()
+    date_txt = f"{now.day} {MONTHS_ID[now.month - 1]} {c['year']}"
+    if c["kind"] == "kelahiran":
+        lead = f"Pada {date_txt}, {name} lahir."
+        if c.get("status") == "hidup":  # usia hanya disebut jika terkonfirmasi masih hidup
+            lead += f" Hari ini, ia genap berusia {now.year - c['year']} tahun."
+        return f"Kelahiran {name}", lead
+    return f"Wafatnya {name}", f"Pada {date_txt}, {name} meninggal dunia."
+
+
+def tone_check(article_text: str, source: str, c: dict) -> list[str]:
+    """Tolak nada duka/kematian yang tidak sesuai dengan jenis peristiwa dan sumbernya."""
+    if c["kind"] == "wafat":
+        return []
+    hard = [p.pattern for p in HARD_DEATH_RES if p.search(article_text)]
+    soft = [p.pattern for p in SOFT_DEATH_RES if p.search(article_text)]
+    if c["kind"] == "kelahiran" and c.get("status") != "meninggal":
+        found = hard + soft
+        if found:
+            return ["nada duka/kematian ('mengenang', 'meninggal', dsb.) tidak pantas: ini kabar kelahiran "
+                    "tokoh yang tidak tercatat meninggal. Tulis dengan nada netral-positif"]
+    elif hard and not SOURCE_DEATH_RE.search(source):
+        return ["kata bernada kematian dipakai padahal sumber tidak menyebut kematian"]
+    return []
+
+
 # ---------------------------------------------------------------- output
 def build_html(candidate: dict, draft: dict) -> str:
-    title = html.escape(draft["title"].strip().rstrip(":"))
+    # Kelahiran/wafat: judul & kalimat pembuka dari kode. Peristiwa: judul dari AI.
+    title = html.escape((candidate.get("title_fixed") or draft["title"]).strip().rstrip(":"))
+    lead = html.escape(candidate.get("lead", ""))
     paragraphs = [html.escape(p.strip()) for p in draft["paragraphs"] if p.strip()]
-    parts = [f"<p><b>Tahun {candidate['year']} - {title}:</b> {paragraphs[0]}</p>"]
+    first = f"{lead} {paragraphs[0]}".strip()
+    parts = [f"<p><b>Tahun {candidate['year']} - {title}:</b> {first}</p>"]
     parts += [f"<p>{p}</p>" for p in paragraphs[1:]]
 
     sources, seen_urls = [], set()
@@ -474,10 +560,12 @@ def main() -> int:
             feedback = ["kandidat sebelumnya tidak punya konfirmasi dari portal berita; pilih kandidat lain"]
             continue
 
-        article_text = f"{draft['title']} " + " ".join(draft["paragraphs"])
+        chosen["title_fixed"], chosen["lead"] = framing(chosen, now)
+        article_text = f"{chosen['title_fixed'] or draft['title']} " + " ".join(draft["paragraphs"])
         source = source_text_of(chosen)
 
         problems = deterministic_check(article_text, source, now.day)
+        problems += tone_check(article_text, source, chosen)
         if not problems:
             try:
                 problems = llm_verify(article_text, source)
