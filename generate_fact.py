@@ -8,7 +8,9 @@ Alur:
       lewat pencarian per-domain dengan filter ketat (tanggal persis + tahun + sepak bola).
 2. Kandidat portal yang cocok dengan kandidat Wikipedia (tahun sama + istilah kunci sama)
    digabung sebagai "konfirmasi silang". Kandidat yang terkonfirmasi diprioritaskan.
-3. Gemini hanya boleh memilih & menulis ulang dari kandidat. Tahun diambil dari DATA, bukan dari AI.
+3. Gemini memilih satu kandidat dari daftar ringkas, lalu menulis HANYA dari isi lengkap sumbernya
+   (untuk kelahiran/wafat: seluruh prosa halaman Wikipedia tokoh). Tahun diambil dari DATA, bukan dari AI.
+   Panjang artikel = 20-50% dari panjang sumber, dipecah menjadi paragraf normal (~100 kata).
 4. Cek deterministik: setiap angka di artikel harus ada di teks sumber.
 5. Cek LLM kedua (verifier, temperature 0): mencari klaim yang tidak didukung sumber.
 6. Jika gagal, today_fact.json LAMA dibiarkan (tidak ditimpa) dan skrip keluar dengan error.
@@ -54,6 +56,19 @@ LENGTH_LANG_FACTOR = float(os.environ.get("LENGTH_LANG_FACTOR", "1.0"))
 MIN_GEN_WORDS = int(os.environ.get("MIN_GEN_WORDS", "20"))
 # Bagian yang ditulis model minimal sekian kata, agar kalimat pembuka kode saja tidak cukup memenuhi 20%.
 MIN_MODEL_WORDS = int(os.environ.get("MIN_MODEL_WORDS", "8"))
+
+WIKI_API = "https://en.wikipedia.org/w/api.php"
+
+# Paragraf "normal": sekitar 100 kata; paragraf pertama dihitung beserta kalimat pembuka sistem.
+PARA_TARGET_WORDS = int(os.environ.get("PARA_TARGET_WORDS", "100"))
+PARA_MIN_WORDS = int(os.environ.get("PARA_MIN_WORDS", "60"))    # paragraf terakhir boleh setengahnya
+PARA_MAX_WORDS = int(os.environ.get("PARA_MAX_WORDS", "140"))
+# Pengaman: halaman Wikipedia yang sangat panjang bisa menuntut ribuan kata dengan rasio 20%.
+MAX_BODY_WORDS = int(os.environ.get("MAX_BODY_WORDS", "1500"))
+# Berapa tokoh (kelahiran/wafat) yang isi lengkap halamannya diunduh per hari.
+FULL_FETCH_LIMIT = int(os.environ.get("FULL_FETCH_LIMIT", "20"))
+# Jika satu kandidat gagal semua percobaan, berapa kandidat berbeda yang dicoba.
+MAX_CANDIDATE_TRIES = int(os.environ.get("MAX_CANDIDATE_TRIES", "2"))
 OUTPUT_FILE = "today_fact.json"
 HEADERS = {"User-Agent": "daily-football-fact/3.0 (ganti-dengan-email-atau-url-blogmu)"}
 
@@ -185,6 +200,70 @@ def ddg_text(query: str, max_results: int = 6) -> list[dict]:
 
 
 # ---------------------------------------------------------------- sumber 1: Wikipedia
+# Bagian artikel Wikipedia yang bukan prosa (daftar, statistik, referensi) tidak dipakai sebagai sumber.
+NON_PROSE_SECTIONS = {
+    "references", "external links", "notes", "further reading", "see also", "honours", "honors",
+    "career statistics", "statistics", "bibliography", "sources", "footnotes", "citations",
+    "works cited", "gallery",
+}
+HEADING_RE = re.compile(r"^(={2,6})\s*(.+?)\s*\1$")
+MIN_PROSE_LINE_WORDS = 8  # baris lebih pendek dianggap sisa tabel/daftar, bukan prosa
+
+
+def clean_article_prose(text: str) -> str:
+    """
+    Dari teks polos artikel Wikipedia, ambil hanya PROSA: buang bagian non-prosa (referensi, tautan luar,
+    statistik, daftar gelar, dsb.), buang judul bagian, dan buang baris pendek sisa tabel/daftar.
+    """
+    keep, drop_level = [], None
+    for raw in text.splitlines():
+        line = raw.strip()
+        m = HEADING_RE.match(line)
+        if m:
+            level, name = len(m.group(1)), m.group(2).strip().lower()
+            if drop_level is not None and level > drop_level:
+                continue  # sub-bagian dari bagian yang sedang dibuang
+            drop_level = level if name in NON_PROSE_SECTIONS else None
+            continue
+        if drop_level is None and count_words(line) >= MIN_PROSE_LINE_WORDS:
+            keep.append(line)
+    return "\n".join(keep)
+
+
+def fetch_article_prose(title: str) -> str:
+    """Isi LENGKAP satu artikel Wikipedia (teks polos, tanpa tabel/catatan kaki), hanya bagian prosa."""
+    try:
+        r = requests.get(WIKI_API, headers=HEADERS, timeout=30, params={
+            "action": "query", "format": "json", "formatversion": 2,
+            "prop": "extracts", "explaintext": 1, "redirects": 1, "titles": title,
+        })
+        r.raise_for_status()
+        pages = r.json().get("query", {}).get("pages", [])
+        return clean_article_prose(pages[0].get("extract") or "") if pages else ""
+    except Exception as e:
+        print(f"  Ambil artikel Wikipedia '{title}' gagal: {e}")
+        return ""
+
+
+def enrich_with_article_prose(cands: list[dict]) -> None:
+    """
+    Ganti ringkasan satu paragraf dengan ISI LENGKAP halaman Wikipedia tokoh, khusus kelahiran/wafat
+    (subjeknya jelas: halaman tokoh itu sendiri). Jika gagal, ringkasan lama tetap dipakai.
+    Peristiwa tidak diubah: halaman pertama yang ditautkan belum tentu inti peristiwanya.
+    """
+    targets = [c for c in cands if c.get("wiki_title")][:FULL_FETCH_LIMIT]
+    if not targets:
+        return
+    ok = 0
+    for c in targets:
+        prose = fetch_article_prose(c["wiki_title"])
+        if count_words(prose) > count_words(c["context"]):
+            c["context"] = prose
+            ok += 1
+        time.sleep(0.3)  # sopan terhadap server Wikimedia
+    print(f"Isi lengkap artikel Wikipedia dimuat untuk {ok}/{len(targets)} tokoh.")
+
+
 def get_wikipedia_candidates(month: int, day: int) -> list[dict]:
     url = f"https://api.wikimedia.org/feed/v1/wikipedia/en/onthisday/all/{month:02d}/{day:02d}"
     try:
@@ -229,6 +308,10 @@ def get_wikipedia_candidates(month: int, day: int) -> list[dict]:
                 "support": [],
                 "subject": text.split(",")[0].strip() if kind_id != "peristiwa" else "",
                 "status": status,
+                # Judul halaman tokoh, dipakai untuk mengunduh isi lengkap artikelnya (hanya kelahiran/wafat).
+                "wiki_title": ((pages[0].get("titles", {}).get("normalized")
+                                or pages[0].get("titles", {}).get("canonical", "").replace("_", " "))
+                               if (pages and kind_id != "peristiwa") else ""),
             })
 
     seen, unique = set(), []
@@ -237,6 +320,7 @@ def get_wikipedia_candidates(month: int, day: int) -> list[dict]:
         if key not in seen:
             seen.add(key)
             unique.append(c)
+    enrich_with_article_prose(unique)
     return unique
 
 
@@ -355,77 +439,126 @@ def source_text_of(c: dict) -> str:
 
 
 # ---------------------------------------------------------------- pemanggilan model
-def call_json(model: str, prompt: str) -> dict:
+def call_json(model: str, prompt: str, max_tokens: int | None = None) -> dict:
     resp = client.models.generate_content(
         model=model,
         contents=prompt,
         config=types.GenerateContentConfig(
             temperature=0.2,
             response_mime_type="application/json",
+            max_output_tokens=max_tokens,
         ),
     )
     raw = re.sub(r"^```(?:json)?|```$", "", resp.text.strip(), flags=re.M).strip()
     return json.loads(raw)
 
 
-def write_article(candidates: list[dict], date_label: str, feedback: list[str]) -> dict:
-    blocks = []
+def pick_candidate(candidates: list[dict], date_label: str) -> int:
+    """
+    Tahap 1: model memilih SATU kandidat dari daftar RINGKAS (cuplikan saja). Isi lengkap sumber (ribuan kata)
+    baru dikirim pada tahap penulisan, hanya untuk kandidat terpilih.
+    """
+    lines = []
     for i, c in enumerate(candidates):
-        block = f"[{i}] ({c['kind']}, tahun {c['year']}) [{c['source']}] {c['text']}\n    Konteks: {c['context'] or '-'}"
+        extra = ""
         if c["kind"] == "kelahiran":
-            block += (f"\n    PENTING: ini adalah KELAHIRAN tokoh pada tanggal hari ini. "
-                      f"Status hidup: {c.get('status') or 'tidak diketahui'}.")
-        elif c["kind"] == "wafat":
-            block += "\n    PENTING: ini adalah WAFATNYA tokoh pada tanggal hari ini."
-        block += (f"\n    PANJANG TULISANMU (batas keras): {c['gen_min']}-{c['gen_max']} kata, "
-                  f"target sekitar {(c['gen_min'] + c['gen_max']) // 2} kata, "
-                  f"{paragraph_target(c)} paragraf (sumber {c['src_words']} kata).")
-        for s in c["support"]:
-            block += f"\n    Sumber tambahan [{s['source']}]: {s['text']}"
-        blocks.append(block)
-    listing = "\n\n".join(blocks)
+            extra = f", status hidup: {c.get('status') or 'tidak diketahui'}"
+        conf = f", dikonfirmasi {', '.join(s['source'] for s in c['support'])}" if c["support"] else ""
+        snippet = " ".join(c["context"].split()[:40])
+        lines.append(
+            f"[{i}] ({c['kind']}, tahun {c['year']}, {c['source']}{conf}{extra}) {c['text']}\n"
+            f"    Cuplikan sumber: {snippet}\n"
+            f"    Sumber {c['src_words']} kata, artikel akan {c['body_min']}-{c['body_max']} kata."
+        )
+    listing = "\n\n".join(lines)
+    prompt = f"""
+Kamu editor blog sejarah sepak bola. Tanggal hari ini: {date_label}.
+Pilih SATU kandidat untuk artikel hari ini.
+
+KRITERIA:
+1. Benar-benar tentang sepak bola (association football/soccer), BUKAN American football, rugby, atau olahraga lain.
+2. Menarik bagi pembaca sepak bola di seluruh dunia.
+3. Utamakan kandidat yang dikonfirmasi portal berita dan yang sumbernya kaya.
+
+KANDIDAT:
+{listing}
+
+KELUARKAN HANYA JSON: {{"candidate_index": <int>}}
+"""
+    try:
+        idx = int(call_json(MODEL, prompt)["candidate_index"])
+        if 0 <= idx < len(candidates):
+            return idx
+        print(f"Indeks kandidat di luar jangkauan ({idx}); pakai kandidat pertama.")
+    except Exception as e:
+        print(f"Pemilihan kandidat gagal ({e}); pakai kandidat pertama.")
+    return 0
+
+
+def write_article(c: dict, date_label: str, feedback: list[str], previous: list[str] | None = None) -> dict:
+    """Tahap 2: tulis artikel HANYA dari sumber lengkap kandidat terpilih."""
+    kind_note = ""
+    if c["kind"] == "kelahiran":
+        kind_note = (f"\nPENTING: ini adalah KELAHIRAN tokoh pada tanggal hari ini. "
+                     f"Status hidup: {c.get('status') or 'tidak diketahui'}.")
+    elif c["kind"] == "wafat":
+        kind_note = "\nPENTING: ini adalah WAFATNYA tokoh pada tanggal hari ini."
+    if c.get("lead"):
+        kind_note += f"\nKalimat pembuka yang SUDAH ditulis sistem (jangan diulang): \"{c['lead']}\""
+
+    source_block = f"[{c['source']}] (tahun {c['year']}) {c['text']}\n\n{c['context'] or '-'}"
+    for s in c["support"]:
+        source_block += f"\n\n[Sumber tambahan: {s['source']}] {s['text']}"
+
+    target = gen_target(c)
+    n_par = paragraph_target(c)
 
     feedback_block = ""
     if feedback:
-        feedback_block = ("\nPERCOBAAN SEBELUMNYA DITOLAK KARENA:\n- " + "\n- ".join(feedback) +
-                          "\nPerbaiki dengan membuang klaim tersebut, atau pilih kandidat lain.\n")
+        feedback_block = "\nDRAFT SEBELUMNYA DITOLAK KARENA:\n- " + "\n- ".join(feedback) + "\n"
+        if previous:
+            feedback_block += ("\nDRAFT SEBELUMNYA:\n" + "\n\n".join(previous) +
+                               "\n\nPerbaiki draft di atas: pertahankan bagian yang benar, buang atau koreksi klaim "
+                               "yang bermasalah, dan sesuaikan panjangnya (tambahkan dari bagian sumber yang belum "
+                               "dicakup jika kurang panjang). Jangan menulis ulang dari nol tanpa alasan.\n")
 
     prompt = f"""
 Kamu penulis blog sejarah sepak bola yang SANGAT mengutamakan akurasi. Tanggal hari ini: {date_label}.
+{kind_note}
 
-KANDIDAT (satu-satunya sumber fakta yang boleh kamu pakai):
-{listing}
+SUMBER (satu-satunya sumber fakta yang boleh kamu pakai):
+{source_block}
 {feedback_block}
 ATURAN MUTLAK:
-1. Pilih SATU kandidat yang benar-benar tentang sepak bola (association football/soccer),
-   BUKAN American football, rugby, atau olahraga lain. Utamakan kandidat yang punya "Sumber tambahan".
-2. Gunakan HANYA fakta yang tertulis eksplisit di kandidat terpilih (teks, konteks, dan sumber tambahan).
-   Tahun, nama pemain/klub/stadion, skor, angka, dan lokasi harus tertulis di sana.
-3. Jika dua sumber berbeda pada suatu detail, JANGAN tulis detail itu. Tulis hanya yang disepakati.
-4. DILARANG menambah detail yang tidak ada di sumber: suasana stadion, jumlah penonton,
-   cuaca, kutipan, perasaan pemain, status "rival", julukan, atau latar sejarah dari ingatanmu.
-5. Jika informasi di sumber sedikit, tulis lebih sederhana.
-   Yang penting informasi harus benar dan bukan mengarang.
-6. Jangan menyebut tanggal/tahun/angka apa pun yang tidak ada di sumber.
-7. Bahasa Indonesia, gaya bercerita ringan tapi tetap faktual. Panjang dan jumlah paragraf mengikuti
-   baris "PANJANG TULISANMU" pada kandidat yang kamu pilih. Itu BATAS KERAS (dihitung otomatis dari
-   panjang sumber), bukan saran. Jangan menambah isi hanya demi memenuhi panjang: pilih kandidat
-   yang sumbernya cukup kaya, dan rangkum dengan padat jika batasnya sempit.
+1. Gunakan HANYA fakta yang tertulis eksplisit di SUMBER. Tahun, nama pemain/klub/stadion, skor, angka,
+   dan lokasi harus tertulis di sana.
+2. Jika dua sumber berbeda pada suatu detail, JANGAN tulis detail itu. Tulis hanya yang disepakati.
+3. DILARANG menambah detail yang tidak ada di sumber: suasana stadion, jumlah penonton, cuaca, kutipan,
+   perasaan pemain, status "rival", julukan, atau latar sejarah dari ingatanmu.
+4. Jangan menyebut tanggal/tahun/angka apa pun yang tidak ada di sumber.
+5. PANJANG (batas keras, dihitung otomatis dari panjang sumber {c['src_words']} kata): tulisanmu harus
+   antara {c['gen_min']} dan {c['gen_max']} kata. Targetkan sekitar {target} kata. Untuk mencapainya, liput
+   bagian-bagian sumber secara menyeluruh dan berimbang (masa awal, klub-klub utama, tim nasional,
+   penghargaan, gaya bermain, kehidupan pribadi, bila ada di sumber) dengan urutan kronologis.
+   Jangan mengulang-ulang dan jangan mengarang demi memenuhi panjang.
+6. PARAGRAF: tulis sekitar {n_par} paragraf. Tiap paragraf sekitar {PARA_TARGET_WORDS} kata
+   ({PARA_MIN_WORDS}-{PARA_MAX_WORDS} kata, kira-kira 4-8 kalimat) dan memuat SATU tema (misalnya: masa awal,
+   satu klub, tim nasional, penghargaan). DILARANG menulis satu blok panjang tanpa jeda paragraf.
+7. Bahasa Indonesia, gaya bercerita ringan tapi tetap faktual.
 8. Jangan tulis tahun di judul; tahun akan ditambahkan sistem.
-9. Jika kandidat berjenis "kelahiran": sistem SUDAH menulis judul dan kalimat pembuka yang menyatakan
-   tokoh itu lahir pada tanggal ini. Jangan ulangi kalimat itu; lanjutkan dengan karier/prestasi yang
-   tertulis di sumber. Nada netral-positif. DILARANG memakai nada duka atau kata seperti "mengenang",
-   "almarhum", "mendiang", "meninggal", "tutup usia" untuk tokoh yang tidak tercatat meninggal.
-10. Jika kandidat berjenis "wafat": sistem sudah menulis judul dan kalimat pembuka. Gunakan nada hormat
-    dan tenang, bukan perayaan.
-11. Untuk judul kandidat "peristiwa": deskriptif dan netral. Jangan memakai kata "Mengenang".
-12. Tulis tokoh yang masih hidup dengan kata kerja masa kini/lampau yang tepat; jangan menyiratkan
-    bahwa ia sudah tiada.
+9. Jika berjenis "kelahiran": sistem SUDAH menulis judul dan kalimat pembuka yang menyatakan tokoh itu lahir
+   pada tanggal ini. Jangan ulangi; lanjutkan dengan karier/prestasi dari sumber. Nada netral-positif.
+   DILARANG memakai nada duka atau kata seperti "mengenang", "almarhum", "mendiang", "meninggal",
+   "tutup usia" untuk tokoh yang tidak tercatat meninggal.
+10. Jika berjenis "wafat": sistem sudah menulis judul dan kalimat pembuka. Gunakan nada hormat dan tenang,
+    bukan perayaan.
+11. Untuk judul "peristiwa": deskriptif dan netral. Jangan memakai kata "Mengenang".
+12. Tulis tokoh yang masih hidup dengan kata kerja yang tepat; jangan menyiratkan bahwa ia sudah tiada.
 
 KELUARKAN HANYA JSON dengan format:
-{{"candidate_index": <int>, "title": "<judul singkat tanpa tahun>", "paragraphs": ["<p1>", "<p2>", "<p3>"]}}
+{{"title": "<judul singkat tanpa tahun>", "paragraphs": ["<paragraf 1>", "<paragraf 2>", "..."]}}
 """
-    return call_json(MODEL, prompt)
+    return call_json(MODEL, prompt, max_tokens=8192)
 
 
 def llm_verify(article_text: str, source: str) -> list[str]:
@@ -533,36 +666,133 @@ def set_budget(c: dict) -> None:
     """
     Hitung rentang panjang. 'body' = isi artikel akhir (kalimat pembuka kode + paragraf model).
     'gen'  = bagian yang boleh ditulis model (body dikurangi kalimat pembuka).
+    Batas atas dijepit ke MAX_BODY_WORDS; jika batas BAWAH saja sudah melewatinya (halaman sangat panjang),
+    kandidat ditandai 'too_long' dan dibuang karena tidak mungkin ditulis dengan andal.
     """
     src_w = source_word_count(c) * LENGTH_LANG_FACTOR
     lead_w = count_words(c.get("lead", ""))
+    raw_min = math.ceil(src_w * LENGTH_MIN_RATIO)
+    raw_max = math.floor(src_w * LENGTH_MAX_RATIO)
     c["src_words"] = round(src_w)
-    c["body_min"] = math.ceil(src_w * LENGTH_MIN_RATIO)
-    c["body_max"] = math.floor(src_w * LENGTH_MAX_RATIO)
+    c["too_long"] = raw_min > MAX_BODY_WORDS
+    c["body_min"] = raw_min
+    c["body_max"] = min(raw_max, MAX_BODY_WORDS)
     c["gen_min"] = max(MIN_MODEL_WORDS, c["body_min"] - lead_w)
     c["gen_max"] = c["body_max"] - lead_w
 
 
+def gen_target(c: dict) -> int:
+    """
+    Sasaran panjang tulisan model: titik tengah rentang (sekitar 35% dari sumber untuk rasio 20-50%).
+    Jika model menulis kurang dari batas bawah, percobaan ulang memakai draf sebelumnya untuk ditambah.
+    """
+    return c["gen_min"] + round(0.5 * (c["gen_max"] - c["gen_min"]))
+
+
 def paragraph_target(c: dict) -> int:
-    """Jumlah paragraf mengikuti panjang target (artikel pendek tidak dipaksa 3-4 paragraf)."""
-    mid = (c["gen_min"] + c["gen_max"]) // 2
-    return 1 if mid < 50 else 2 if mid < 110 else 3 if mid < 200 else 4
+    """Jumlah paragraf = panjang sasaran dibagi panjang paragraf normal (minimal 1)."""
+    return max(1, round(gen_target(c) / PARA_TARGET_WORDS))
 
 
 def prepare_candidates(cands: list[dict], now: datetime) -> list[dict]:
-    """Pasang judul/kalimat pembuka + anggaran panjang. Buang kandidat yang sumbernya terlalu pendek."""
-    ready, skipped = [], 0
+    """Pasang judul/kalimat pembuka + anggaran panjang. Buang kandidat yang sumbernya terlalu pendek/panjang."""
+    ready, too_short, too_long = [], 0, 0
     for c in cands:
         c["title_fixed"], c["lead"] = framing(c, now)
         set_budget(c)
+        if c["too_long"]:
+            too_long += 1
+            continue
         if c["gen_max"] < MIN_GEN_WORDS:
-            skipped += 1
+            too_short += 1
             continue
         ready.append(c)
-    if skipped:
-        print(f"{skipped} kandidat dibuang karena sumbernya terlalu pendek untuk rentang "
+    if too_short:
+        print(f"{too_short} kandidat dibuang karena sumbernya terlalu pendek untuk rentang "
               f"{LENGTH_MIN_RATIO:.0%}-{LENGTH_MAX_RATIO:.0%}.")
+    if too_long:
+        print(f"{too_long} kandidat dibuang karena artikelnya akan melebihi {MAX_BODY_WORDS} kata "
+              f"(naikkan MAX_BODY_WORDS jika ingin menyertakannya).")
     return ready
+
+
+# ---------------------------------------------------------------- paragraf normal
+# Singkatan/inisial yang diakhiri titik tetapi bukan akhir kalimat.
+ABBREV = {"dr", "mr", "mrs", "ms", "st", "jr", "sr", "vs", "no", "prof", "ir", "drs", "hj", "h"}
+
+
+def split_sentences(text: str) -> list[str]:
+    """Pecah teks menjadi kalimat; tidak memecah setelah singkatan (Dr., vs., U.S.) atau inisial satu huruf."""
+    parts, start = [], 0
+    for m in re.finditer(r"[.!?]+[\"'\u201d\u2019)]?\s+(?=[\"'\u201c\u2018(]?[A-Z0-9])", text):
+        before = text[start:m.start()].split()
+        last = before[-1].lower().strip("\"'\u201c\u2018(") if before else ""
+        if last in ABBREV or len(last) == 1 or re.fullmatch(r"(?:[a-z]\.)+[a-z]?", last):
+            continue
+        parts.append(text[start:m.end()].strip())
+        start = m.end()
+    tail = text[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _eff_words(p: str, index: int, lead_w: int) -> int:
+    """Panjang paragraf sebagaimana tampil; paragraf pertama dihitung beserta kalimat pembuka sistem."""
+    return count_words(p) + (lead_w if index == 0 else 0)
+
+
+def _split_into(p: str, k: int, offset: int) -> list[str]:
+    """Pecah satu paragraf panjang menjadi ~k paragraf berukuran seimbang, hanya di batas kalimat."""
+    sents = split_sentences(p)
+    if len(sents) < 2:
+        return [p]
+    per = (offset + sum(count_words(s) for s in sents)) / k
+    groups, cur, cur_w = [], [], offset
+    for j, s in enumerate(sents):
+        cur.append(s)
+        cur_w += count_words(s)
+        if cur_w >= per and len(groups) < k - 1 and j < len(sents) - 1:
+            groups.append(" ".join(cur))
+            cur, cur_w = [], 0
+    if cur:
+        groups.append(" ".join(cur))
+    if len(groups) > 1 and count_words(groups[-1]) < PARA_MIN_WORDS // 2:  # sisa terlalu kecil -> gabung
+        groups[-2] += " " + groups.pop()
+    return groups
+
+
+def normalize_paragraphs(paragraphs: list[str], lead_w: int = 0) -> list[str]:
+    """
+    Pastikan hasil berupa paragraf NORMAL (sekitar PARA_TARGET_WORDS kata), apa pun format keluaran model:
+    (a) paragraf yang terlalu pendek digabung ke tetangganya;
+    (b) paragraf yang terlalu panjang dipecah di batas kalimat.
+    Jumlah kata total tidak berubah; hanya penempatan jeda paragraf.
+    """
+    paras = [" ".join(p.split()) for p in paragraphs if p and p.strip()]
+
+    i = 0
+    while len(paras) > 1 and i < len(paras):
+        threshold = PARA_MIN_WORDS if i < len(paras) - 1 else PARA_MIN_WORDS // 2
+        if _eff_words(paras[i], i, lead_w) < threshold:
+            if i > 0:
+                paras[i - 1] += " " + paras[i]
+                del paras[i]
+            else:
+                paras[1] = paras[0] + " " + paras[1]
+                del paras[0]
+            continue
+        i += 1
+
+    out = []
+    for i, p in enumerate(paras):
+        offset = lead_w if i == 0 else 0
+        w = count_words(p) + offset
+        if w <= PARA_MAX_WORDS:
+            out.append(p)
+        else:
+            out.extend(_split_into(p, max(2, math.ceil(w / PARA_TARGET_WORDS)), offset))
+    return out
 
 
 def fit_length(paragraphs: list[str], c: dict) -> list[str]:
@@ -582,11 +812,14 @@ def length_check(c: dict, paragraphs: list[str]) -> list[str]:
     gen_w = sum(count_words(p) for p in paragraphs)
     if c["gen_min"] <= gen_w <= c["gen_max"]:
         return []
-    target = (c["gen_min"] + c["gen_max"]) // 2
-    return [f"tulisanmu {gen_w} kata, di luar batas {c['gen_min']}-{c['gen_max']} kata "
-            f"(total artikel {lead_w + gen_w} kata termasuk kalimat pembuka sistem {lead_w} kata; rentang total "
-            f"{c['body_min']}-{c['body_max']} kata = {LENGTH_MIN_RATIO:.0%}-{LENGTH_MAX_RATIO:.0%} dari sumber "
-            f"{c['src_words']} kata). Targetkan sekitar {target} kata"]
+    detail = (f"(total artikel {lead_w + gen_w} kata termasuk kalimat pembuka sistem {lead_w} kata; rentang total "
+              f"{c['body_min']}-{c['body_max']} kata = {LENGTH_MIN_RATIO:.0%}-{LENGTH_MAX_RATIO:.0%} dari sumber "
+              f"{c['src_words']} kata)")
+    if gen_w < c["gen_min"]:
+        return [f"tulisanmu terlalu pendek: {gen_w} kata, minimal {c['gen_min']} {detail}. Tambahkan sekitar "
+                f"{gen_target(c) - gen_w} kata dari bagian sumber yang belum kamu cakup (tanpa mengarang)"]
+    return [f"tulisanmu terlalu panjang: {gen_w} kata, maksimal {c['gen_max']} {detail}. "
+            f"Ringkas hingga sekitar {gen_target(c)} kata"]
 
 
 # ---------------------------------------------------------------- output
@@ -611,41 +844,13 @@ def build_html(candidate: dict, draft: dict) -> str:
 
 
 # ---------------------------------------------------------------- main
-def main() -> int:
-    now = datetime.now(timezone.utc)  # UTC: acuan universal untuk pembaca di seluruh dunia
-    date_label = f"{now.day} {MONTHS_ID[now.month - 1]}"
-    print(f"Memproses fakta bola untuk {date_label} (UTC)...")
+def select_candidate(candidates: list[dict], date_label: str) -> dict | None:
+    """Pilih kandidat (LLM), lalu cari konfirmasi portal. Mode ketat: kandidat tanpa konfirmasi dibuang."""
+    while candidates:
+        idx = pick_candidate(candidates, date_label)
+        chosen = candidates[idx]
+        print(f"Kandidat terpilih: [{chosen['year']}] {chosen['text'][:80]}")
 
-    wiki = get_wikipedia_candidates(now.month, now.day)
-    print(f"Wikipedia: {len(wiki)} kandidat sepak bola.")
-    portal = get_portal_candidates(now.month, now.day)
-    print(f"Portal berita: {len(portal)} kandidat.")
-
-    merged = merge_candidates(wiki, portal)
-    candidates = prepare_candidates(merged, now)[:MAX_CANDIDATES]
-    if not candidates:
-        print("Tidak ada kandidat dengan sumber yang cukup panjang. File lama dipertahankan.")
-        return 1
-    confirmed = sum(1 for c in candidates if c["support"])
-    print(f"Total {len(candidates)} kandidat ({confirmed} sudah terkonfirmasi silang).")
-
-    feedback: list[str] = []
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        if not candidates:
-            break
-        print(f"Percobaan {attempt}/{MAX_ATTEMPTS}...")
-        try:
-            draft = write_article(candidates, date_label, feedback)
-            idx = int(draft["candidate_index"])
-            chosen = candidates[idx]
-            if not draft.get("paragraphs"):
-                raise ValueError("paragraf kosong")
-        except Exception as e:
-            print(f"Output model tidak valid: {e}")
-            feedback = [f"format output salah ({e})"]
-            continue
-
-        # Cari konfirmasi portal untuk kandidat terpilih jika belum ada.
         if not chosen["support"] and not chosen.get("_corroboration_tried"):
             chosen["_corroboration_tried"] = True
             chosen["support"] = corroborate(chosen)
@@ -653,17 +858,45 @@ def main() -> int:
             if chosen["support"]:
                 print(f"  Terkonfirmasi oleh: {', '.join(s['source'] for s in chosen['support'])}")
 
-        if REQUIRE_CORROBORATION and not chosen["support"]:
-            print("  Ditolak: tidak ada konfirmasi dari portal berita.")
+        if chosen["too_long"]:
+            print("  Dibuang: artikelnya akan melebihi batas panjang.")
             candidates.pop(idx)
-            feedback = ["kandidat sebelumnya tidak punya konfirmasi dari portal berita; pilih kandidat lain"]
+            continue
+        if REQUIRE_CORROBORATION and not chosen["support"]:
+            print("  Dibuang: tidak ada konfirmasi dari portal berita.")
+            candidates.pop(idx)
+            continue
+        return chosen
+    return None
+
+
+def try_write(chosen: dict, date_label: str, now: datetime) -> dict | None:
+    """Tulis + verifikasi untuk SATU kandidat. Percobaan ulang memakai draf sebelumnya sebagai dasar perbaikan."""
+    feedback: list[str] = []
+    previous: list[str] | None = None
+    lead_w = count_words(chosen.get("lead", ""))
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        print(f"Percobaan {attempt}/{MAX_ATTEMPTS}...")
+        try:
+            draft = write_article(chosen, date_label, feedback, previous)
+            paras = [p for p in draft.get("paragraphs", []) if isinstance(p, str) and p.strip()]
+            if not paras:
+                raise ValueError("paragraf kosong")
+        except Exception as e:
+            print(f"Output model tidak valid: {e}")
+            feedback = [f"format output salah ({e})"]
             continue
 
-        draft["paragraphs"] = fit_length(draft["paragraphs"], chosen)
-        article_text = f"{chosen['title_fixed'] or draft['title']} " + " ".join(draft["paragraphs"])
+        paras = normalize_paragraphs(paras, lead_w)  # pastikan paragraf normal, bukan satu blok
+        paras = fit_length(paras, chosen)
+        draft["paragraphs"] = paras
+        previous = paras
+
+        article_text = f"{chosen['title_fixed'] or draft.get('title', '')} " + " ".join(paras)
         source = source_text_of(chosen)
 
-        problems = length_check(chosen, draft["paragraphs"])
+        problems = length_check(chosen, paras)
         problems += deterministic_check(article_text, source, now.day)
         problems += tone_check(article_text, source, chosen)
         if not problems:
@@ -676,16 +909,46 @@ def main() -> int:
             print("Ditolak:", problems)
             feedback = problems
             continue
+        return draft
+    return None
 
-        data = {"date": date_label, "fact": build_html(chosen, draft)}
-        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
-        body_w = count_words(chosen.get("lead", "")) + sum(count_words(p) for p in draft["paragraphs"])
-        print(f"Panjang artikel {body_w} kata = {body_w / max(chosen['src_words'], 1):.0%} "
-              f"dari sumber ({chosen['src_words']} kata).")
-        used = [chosen["url"]] + [s["url"] for s in chosen["support"]]
-        print(f"Berhasil memperbarui {OUTPUT_FILE}. Sumber: {', '.join(used)}")
-        return 0
+
+def main() -> int:
+    now = datetime.now(timezone.utc)  # UTC: acuan universal untuk pembaca di seluruh dunia
+    date_label = f"{now.day} {MONTHS_ID[now.month - 1]}"
+    print(f"Memproses fakta bola untuk {date_label} (UTC)...")
+
+    wiki = get_wikipedia_candidates(now.month, now.day)
+    print(f"Wikipedia: {len(wiki)} kandidat sepak bola.")
+    portal = get_portal_candidates(now.month, now.day)
+    print(f"Portal berita: {len(portal)} kandidat.")
+
+    ready = prepare_candidates(merge_candidates(wiki, portal), now)
+    ready.sort(key=lambda c: (-len(c["support"]), -c["src_words"]))  # terkonfirmasi & terkaya di depan
+    candidates = ready[:MAX_CANDIDATES]
+    if not candidates:
+        print("Tidak ada kandidat dengan panjang sumber yang sesuai. File lama dipertahankan.")
+        return 1
+    confirmed = sum(1 for c in candidates if c["support"])
+    print(f"Total {len(candidates)} kandidat ({confirmed} sudah terkonfirmasi silang).")
+
+    for _ in range(MAX_CANDIDATE_TRIES):
+        chosen = select_candidate(candidates, date_label)
+        if chosen is None:
+            break
+        draft = try_write(chosen, date_label, now)
+        if draft:
+            data = {"date": date_label, "fact": build_html(chosen, draft)}
+            with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+            body_w = count_words(chosen.get("lead", "")) + sum(count_words(p) for p in draft["paragraphs"])
+            print(f"Panjang artikel {body_w} kata dalam {len(draft['paragraphs'])} paragraf = "
+                  f"{body_w / max(chosen['src_words'], 1):.0%} dari sumber ({chosen['src_words']} kata).")
+            used = [chosen["url"]] + [s["url"] for s in chosen["support"]]
+            print(f"Berhasil memperbarui {OUTPUT_FILE}. Sumber: {', '.join(used)}")
+            return 0
+        print("Kandidat ini gagal semua percobaan; mencoba kandidat lain.")
+        candidates.remove(chosen)
 
     print("Semua percobaan gagal verifikasi. File lama dipertahankan.")
     return 1
