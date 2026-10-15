@@ -49,7 +49,7 @@ MAX_CANDIDATES = 12
 
 # Panjang artikel dihitung sebagai persentase dari panjang sumber (dalam jumlah kata).
 LENGTH_MIN_RATIO = float(os.environ.get("LENGTH_MIN_RATIO", "0.20"))  # minimal 20% dari sumber
-LENGTH_MAX_RATIO = float(os.environ.get("LENGTH_MAX_RATIO", "0.50"))  # maksimal 40% dari sumber
+LENGTH_MAX_RATIO = float(os.environ.get("LENGTH_MAX_RATIO", "0.50"))  # maksimal 50% dari sumber
 # Kalibrasi selisih bahasa (sumber Inggris vs artikel Indonesia). 1.0 = hitung apa adanya.
 LENGTH_LANG_FACTOR = float(os.environ.get("LENGTH_LANG_FACTOR", "1.0"))
 # Kandidat dibuang jika bagian yang boleh ditulis model kurang dari ini (terlalu sedikit untuk satu kalimat utuh).
