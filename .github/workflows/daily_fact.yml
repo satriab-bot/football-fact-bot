@@ -2,7 +2,7 @@ name: Generate Daily Football Fact
 
 on:
   schedule:
-    - cron: '59 21 * * *'   # 22:17 UTC = 05:17 WIB
+    - cron: '7 0 * * *'   # 22:17 UTC = 05:17 WIB
   workflow_dispatch:
 
 concurrency:
