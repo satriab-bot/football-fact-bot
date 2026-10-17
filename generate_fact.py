@@ -70,7 +70,7 @@ FULL_FETCH_LIMIT = int(os.environ.get("FULL_FETCH_LIMIT", "20"))
 # Jika satu kandidat gagal semua percobaan, berapa kandidat berbeda yang dicoba.
 MAX_CANDIDATE_TRIES = int(os.environ.get("MAX_CANDIDATE_TRIES", "2"))
 OUTPUT_FILE = "today_fact.json"
-HEADERS = {"User-Agent": "daily-football-fact/3.0 (ganti-dengan-email-atau-url-blogmu)"}
+HEADERS = {"User-Agent": "daily-football-fact/3.0 (https://eplsentris.blogspot.com)"}
 
 MONTHS_ID = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli",
              "Agustus", "September", "Oktober", "November", "Desember"]
