@@ -554,6 +554,8 @@ ATURAN MUTLAK:
     bukan perayaan.
 11. Untuk judul "peristiwa": deskriptif dan netral. Jangan memakai kata "Mengenang".
 12. Tulis tokoh yang masih hidup dengan kata kerja yang tepat; jangan menyiratkan bahwa ia sudah tiada.
+13. DILARANG menuliskan tulisan "Sumber: ..." atau menyebutkan nama media/Wikipedia di dalam atau di akhir artikel.
+14. Paragraf pertama HARUS diawali dengan tanggal dan tahun kejadian serta judul/pembuka peristiwa, tanpa mengulang kalimat yang sama di awal.
 
 KELUARKAN HANYA JSON dengan format:
 {{"title": "<judul singkat tanpa tahun>", "paragraphs": ["<paragraf 1>", "<paragraf 2>", "..."]}}
@@ -614,10 +616,9 @@ def life_status(extract: str) -> str:
 
 def framing(c: dict, now: datetime) -> tuple[str, str]:
     """
-    Judul + kalimat pembuka yang dibuat KODE (bukan AI) untuk kelahiran/wafat, supaya jenis
-    peristiwanya selalu eksplisit dan nadanya tepat. Untuk 'peristiwa' mengembalikan ("", "").
+    Menyerahkan pembuatan kalimat pembuka sepenuhnya ke Gemini 
+    agar tidak terjadi pengulangan kalimat lahir/wafat.
     """
-    if c["kind"] not in ("kelahiran", "wafat"):
         return "", ""
     name = c.get("subject") or c["text"].split(",")[0].strip()
     date_txt = f"{now.day} {MONTHS_ID[now.month - 1]} {c['year']}"
