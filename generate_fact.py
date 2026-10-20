@@ -833,14 +833,6 @@ def build_html(candidate: dict, draft: dict) -> str:
     parts = [f"<p><b>Tahun {candidate['year']} - {title}:</b> {first}</p>"]
     parts += [f"<p>{p}</p>" for p in paragraphs[1:]]
 
-    sources, seen_urls = [], set()
-    for label, url in [(candidate["source"], candidate["url"])] + \
-                      [(s["source"], s["url"]) for s in candidate["support"]]:
-        if url and url not in seen_urls:
-            seen_urls.add(url)
-            sources.append(f'<a href="{html.escape(url)}" target="_blank" rel="noopener">{html.escape(label)}</a>')
-    if sources:
-        parts.append(f"<p><small>Sumber: {', '.join(sources)}</small></p>")
     return "\n".join(parts)
 
 
