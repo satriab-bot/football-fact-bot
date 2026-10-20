@@ -619,7 +619,7 @@ def framing(c: dict, now: datetime) -> tuple[str, str]:
     Menyerahkan pembuatan kalimat pembuka sepenuhnya ke Gemini 
     agar tidak terjadi pengulangan kalimat lahir/wafat.
     """
-        return "", ""
+    return "", ""
     name = c.get("subject") or c["text"].split(",")[0].strip()
     date_txt = f"{now.day} {MONTHS_ID[now.month - 1]} {c['year']}"
     if c["kind"] == "kelahiran":
