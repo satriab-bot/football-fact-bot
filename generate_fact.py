@@ -48,13 +48,13 @@ MAX_ATTEMPTS = 5
 MAX_CANDIDATES = 12
 
 # Panjang artikel dihitung sebagai persentase dari panjang sumber (dalam jumlah kata).
-LENGTH_MIN_RATIO = float(os.environ.get("LENGTH_MIN_RATIO", "0.10"))  # minimal 10% dari sumber
+LENGTH_MIN_RATIO = float(os.environ.get("LENGTH_MIN_RATIO", "0.20"))  # minimal 20% dari sumber
 LENGTH_MAX_RATIO = float(os.environ.get("LENGTH_MAX_RATIO", "0.50"))  # maksimal 50% dari sumber
 # Kalibrasi selisih bahasa (sumber Inggris vs artikel Indonesia). 1.0 = hitung apa adanya.
 LENGTH_LANG_FACTOR = float(os.environ.get("LENGTH_LANG_FACTOR", "1.0"))
 # Kandidat dibuang jika bagian yang boleh ditulis model kurang dari ini (terlalu sedikit untuk satu kalimat utuh).
 MIN_GEN_WORDS = int(os.environ.get("MIN_GEN_WORDS", "20"))
-# Bagian yang ditulis model minimal sekian kata, agar kalimat pembuka kode saja tidak cukup memenuhi 10%.
+# Bagian yang ditulis model minimal sekian kata, agar kalimat pembuka kode saja tidak cukup memenuhi 20%.
 MIN_MODEL_WORDS = int(os.environ.get("MIN_MODEL_WORDS", "8"))
 
 WIKI_API = "https://en.wikipedia.org/w/api.php"
@@ -63,7 +63,7 @@ WIKI_API = "https://en.wikipedia.org/w/api.php"
 PARA_TARGET_WORDS = int(os.environ.get("PARA_TARGET_WORDS", "100"))
 PARA_MIN_WORDS = int(os.environ.get("PARA_MIN_WORDS", "60"))    # paragraf terakhir boleh setengahnya
 PARA_MAX_WORDS = int(os.environ.get("PARA_MAX_WORDS", "140"))
-# Pengaman: halaman Wikipedia yang sangat panjang bisa menuntut ribuan kata dengan rasio 10%.
+# Pengaman: halaman Wikipedia yang sangat panjang bisa menuntut ribuan kata dengan rasio 20%.
 MAX_BODY_WORDS = int(os.environ.get("MAX_BODY_WORDS", "1500"))
 # Berapa tokoh (kelahiran/wafat) yang isi lengkap halamannya diunduh per hari.
 FULL_FETCH_LIMIT = int(os.environ.get("FULL_FETCH_LIMIT", "20"))
